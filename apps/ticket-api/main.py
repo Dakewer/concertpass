@@ -1,19 +1,24 @@
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 import psycopg2
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-app = FastAPI()
-
-
-class ReserveRequest(BaseModel):
-    concert_id: str
-    user_id: str
-    ticket_type: str
-    quantity: int
+CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_id UUID PRIMARY KEY,
+    concert_id     VARCHAR NOT NULL,
+    user_id        VARCHAR NOT NULL,
+    ticket_type    VARCHAR NOT NULL,
+    quantity       INTEGER NOT NULL,
+    status         VARCHAR NOT NULL,
+    created_at     TIMESTAMP NOT NULL,
+    updated_at     TIMESTAMP NOT NULL
+);
+"""
 
 
 def get_connection():
@@ -23,7 +28,30 @@ def get_connection():
         dbname=os.environ["DB_NAME"],
         user=os.environ["DB_USER"],
         password=os.environ["DB_PASSWORD"],
+        connect_timeout=10,
     )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(CREATE_TABLE_SQL)
+        conn.commit()
+    finally:
+        conn.close()
+    yield
+
+
+app = FastAPI(title="ticket-api", lifespan=lifespan)
+
+
+class ReserveRequest(BaseModel):
+    concert_id: str
+    user_id: str
+    ticket_type: str
+    quantity: int
 
 
 @app.post("/reserve")
