@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ticket-worker
+  namespace: concertpass
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ticket-worker }
+  template:
+    metadata:
+      labels: { app: ticket-worker }
+    spec:
+      serviceAccountName: ticket-worker
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: ticket-worker
+          image: REPLACE_IMAGE
+          envFrom:
+            - configMapRef: { name: runtime-config }
+            - secretRef: { name: database }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }

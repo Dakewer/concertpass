@@ -4,6 +4,8 @@
 *.tfstate
 *.tfstate.*
 *.tfvars
+*.tfplan
+infra/.generated/
 # Python
 __pycache__/
 *.pyc

@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aws-infrastructure-check
+  namespace: concertpass
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 180
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: aws-cli
+          image: public.ecr.aws/aws-cli/aws-cli:latest
+          envFrom:
+            - configMapRef: { name: runtime-config }
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              export AWS_PAGER=""
+              aws sts get-caller-identity --query Arn --output text
+              aws sqs get-queue-attributes --queue-url "$SQS_QUEUE_URL" --attribute-names FifoQueue RedrivePolicy --output json
+              test "$(aws sqs get-queue-attributes --queue-url "$SQS_QUEUE_URL" --attribute-names FifoQueue --query Attributes.FifoQueue --output text)" = true
+              EVENTS_COUNT="$(aws dynamodb scan --table-name "$EVENTS_TABLE" --select COUNT --query Count --output text)"
+              echo "Conciertos precargados: $EVENTS_COUNT"
+              test "$EVENTS_COUNT" -ge 2
+              aws dynamodb get-item --table-name "$EVENTS_TABLE" --key '{"concert_id":{"S":"bad-bunny-gdl"}}' --projection-expression '#cap' --expression-attribute-names '{"#cap":"capacity"}' --output json
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 250m, memory: 256Mi }

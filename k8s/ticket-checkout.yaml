@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ticket-checkout
+  namespace: concertpass
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ticket-checkout }
+  template:
+    metadata:
+      labels: { app: ticket-checkout }
+    spec:
+      serviceAccountName: ticket-checkout
+      containers:
+        - name: ticket-checkout
+          image: REPLACE_IMAGE
+          ports: [{ name: http, containerPort: 8080 }]
+          envFrom:
+            - configMapRef: { name: runtime-config }
+          startupProbe: { tcpSocket: { port: http }, periodSeconds: 5, failureThreshold: 30 }
+          readinessProbe: { tcpSocket: { port: http }, periodSeconds: 5 }
+          livenessProbe: { tcpSocket: { port: http }, periodSeconds: 20 }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ticket-checkout
+  namespace: concertpass
+spec:
+  type: ClusterIP
+  selector: { app: ticket-checkout }
+  ports: [{ name: http, port: 80, targetPort: http }]

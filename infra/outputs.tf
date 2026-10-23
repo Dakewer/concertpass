@@ -1,27 +1,24 @@
-output "endpoint" {
-  value = aws_db_instance.main.address
+output "region" {
+  value = var.region
 }
-
-output "db_port" {
-  value = aws_db_instance.main.port
+output "cluster_name" {
+  value = aws_eks_cluster.main.name
 }
-
-output "db_username" {
-  value = aws_db_instance.main.username
+output "account_id" {
+  value = data.aws_caller_identity.current.account_id
 }
-
-output "db_name" {
-  value = aws_db_instance.main.db_name
+output "queue_url" {
+  value = aws_sqs_queue.reservations.url
 }
-
-output "db_password" {
-  description = "Use with: terraform output -raw db_password"
-  value       = random_password.db.result
-  sensitive   = true
+output "events_table" {
+  value = aws_dynamodb_table.events.name
 }
-
-output "connection_url" {
-  description = "Use with: terraform output -raw connection_url"
-  value       = "postgresql://${aws_db_instance.main.username}:${random_password.db.result}@${aws_db_instance.main.address}:${aws_db_instance.main.port}/${aws_db_instance.main.db_name}"
-  sensitive   = true
+output "db_secret_arn" {
+  value = aws_secretsmanager_secret.db.arn
+}
+output "ecr_urls" {
+  value = { for name, repo in aws_ecr_repository.service : name => repo.repository_url }
+}
+output "node_role_arn" {
+  value = data.aws_iam_role.nodes.arn
 }

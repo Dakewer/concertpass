@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reservations-schema
+  namespace: concertpass
+data:
+  schema.sql: |
+    CREATE TABLE IF NOT EXISTS reservations (
+      reservation_id UUID PRIMARY KEY,
+      concert_id VARCHAR NOT NULL,
+      user_id VARCHAR NOT NULL,
+      ticket_type VARCHAR NOT NULL,
+      quantity INTEGER NOT NULL,
+      status VARCHAR NOT NULL,
+      created_at TIMESTAMP NOT NULL,
+      updated_at TIMESTAMP NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS reservations_inventory_idx
+      ON reservations (concert_id, ticket_type, status);
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reservations-schema
+  namespace: concertpass
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 180
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: psql
+          image: postgres:16-alpine
+          envFrom:
+            - secretRef: { name: database }
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              export PGHOST="$DB_HOST" PGPORT="$DB_PORT" PGDATABASE="$DB_NAME"
+              export PGUSER="$DB_USER" PGPASSWORD="$DB_PASSWORD" PGSSLMODE=require
+              psql -v ON_ERROR_STOP=1 -f /schema/schema.sql
+              psql -v ON_ERROR_STOP=1 -c '\d reservations'
+          volumeMounts:
+            - { name: schema, mountPath: /schema, readOnly: true }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+      volumes:
+        - name: schema
+          configMap: { name: reservations-schema }
