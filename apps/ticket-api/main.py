@@ -1,11 +1,16 @@
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+import boto3
 import psycopg2
-from fastapi import FastAPI
+from botocore.exceptions import BotoCoreError, ClientError
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+sqs = boto3.client("sqs", region_name=os.environ["AWS_REGION"])
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS reservations (
@@ -74,17 +79,40 @@ def reserve(req: ReserveRequest):
                     req.user_id,
                     req.ticket_type,
                     req.quantity,
-                    "confirmed",
+                    "pending",
                     now,
                     now,
                 ),
             )
         conn.commit()
+
+        # Enqueue only after the commit, so the worker never gets a reservation it can't see yet.
+        # MessageGroupId = concert_id keeps each concert's reservations in arrival order.
+        try:
+            sqs.send_message(
+                QueueUrl=os.environ["SQS_QUEUE_URL"],
+                MessageBody=json.dumps(
+                    {
+                        "reservation_id": reservation_id,
+                        "concert_id": req.concert_id,
+                        "user_id": req.user_id,
+                        "ticket_type": req.ticket_type,
+                        "quantity": req.quantity,
+                    }
+                ),
+                MessageGroupId=req.concert_id,
+                MessageDeduplicationId=reservation_id,
+            )
+        except (BotoCoreError, ClientError):
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM reservations WHERE reservation_id = %s", (reservation_id,))
+            conn.commit()
+            raise HTTPException(status_code=503, detail="Could not enqueue reservation, try again")
     finally:
         conn.close()
 
     return {
         "reservation_id": reservation_id,
         "concert_id": req.concert_id,
-        "status": "confirmed",
+        "status": "pending",
     }
