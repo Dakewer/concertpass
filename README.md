@@ -1,20 +1,41 @@
-# Concertpass: infraestructura
+# Concertpass: sistema de reservación de boletos
 
-Este cambio administra infraestructura AWS, despliegue y manifiestos Kubernetes. El codigo de `ticket-api` y `ticket-checkout` se conserva como esta en Git; `ticket-worker` corresponde al responsable de ese servicio.
+Concertpass es un sistema de reservación de boletos para conciertos compuesto por tres microservicios desplegados en un cluster EKS de AWS. El sistema recibe solicitudes de compra, las procesa en orden por concierto mediante SQS FIFO, y garantiza que no se venda más del aforo disponible usando una transacción con `FOR UPDATE` en PostgreSQL.
 
+- `ticket-api`: recibe `POST /reserve`, inserta la reservación en RDS con estado `pending`, encola el mensaje en SQS FIFO con `MessageGroupId=concert_id` y expone `GET /reservation/{id}`.
+- `ticket-worker`: consume SQS FIFO, consulta la capacidad del concierto en DynamoDB, calcula la disponibilidad en RDS con `FOR UPDATE`, actualiza a `booked` o `rejected`, y confirma con `ticket-checkout` para pasar a `confirmed`.
+- `ticket-checkout`: simula el procesador de pagos; `POST /checkout` responde 200 OK y el worker actualiza a `confirmed`.
+Los tres servicios tienen Dockerfile, imagen publicada en Amazon ECR y manifiesto de Kubernetes en `k8s/`.
+
+## Nota sobre la estructura del repositorio
+
+La estructura difiere ligeramente del layout sugerido en el enunciado:
+
+- Los scripts viven en `apps/scripts/` (no en `scripts/` en la raíz).
+- Los servicios están bajo `apps/` (`apps/ticket-api/`, etc.).
+
+Esta organización se adoptó desde el inicio del proyecto y se mantiene para no romper rutas ya configuradas por todo el equipo (Dockerfiles, manifiestos, comandos documentados abajo). Todos los comandos de este README usan las rutas reales del repositorio.
+
+## Arquitectura
 ```mermaid
 flowchart LR
-    TF[Terraform] --> EKS[EKS: dos nodos]
-    TF --> RDS[PostgreSQL privado]
-    TF --> SQS[SQS FIFO y DLQ]
-    TF --> DDB[DynamoDB: dos conciertos]
-    TF --> SM[Secrets Manager]
-    TF --> ECR[Tres repositorios ECR]
-    SM -. Variables de entorno .-> EKS
-    ECR -. Imagenes .-> EKS
-    EKS --> RDS
-    EKS --> SQS
-    EKS --> DDB
+    U[Cliente] -->|POST /reserve| API[ticket-api<br/>NodePort 30080]
+    API -->|INSERT pending| RDS[(RDS PostgreSQL)]
+    API -->|send_message<br/>MessageGroupId=concert_id| SQS[SQS FIFO + DLQ]
+    SQS -->|polling| W[ticket-worker]
+    W -->|get_item capacity| DDB[(DynamoDB)]
+    W -->|FOR UPDATE<br/>booked/rejected| RDS
+    W -->|POST /checkout| CO[ticket-checkout<br/>ClusterIP]
+    CO -->|200 OK| W
+    W -->|UPDATE confirmed| RDS
+    U -->|GET /reservation/id| API
+    API -->|SELECT status| RDS
+
+    TF[Terraform] -.-> API
+    TF -.-> RDS
+    TF -.-> SQS
+    TF -.-> DDB
+    TF -.-> CO
 ```
 
 ## Recursos
@@ -52,16 +73,36 @@ Los valores de capacidad se precargan mediante Terraform en DynamoDB. Publicar m
 
 ## Imagenes y manifiestos
 
-Publica las imagenes de los servicios que ya tienen Dockerfile con un tag nuevo:
+Publica las imagenes de los servicios con un tag nuevo:
 
 ```powershell
-python apps/scripts/infrastructure.py images --tag entrega-01 --services ticket-api ticket-checkout
-python apps/scripts/infrastructure.py deploy --tag entrega-01 --services ticket-api ticket-checkout
+python apps/scripts/infrastructure.py images --tag entrega-01
+python apps/scripts/infrastructure.py deploy --tag entrega-01
 ```
 
-Cuando el equipo tenga el worker completo, puede publicar y desplegar los tres omitiendo `--services`. Los tags ECR son inmutables; cada publicacion debe utilizar un tag distinto. Deploy comprueba que existan todas las imagenes solicitadas antes de modificar Kubernetes, reemplaza `REPLACE_IMAGE` en los manifiestos y espera sus rollouts. No se debe aplicar directamente un Deployment que aun contenga ese marcador.
+## Scripts de escenarios y evidencia
 
-En Bash estan disponibles `apps/scripts/publish_images.sh` y `apps/scripts/deploy.sh` con los mismos argumentos. El worker tiene una replica; se puede escalar temporalmente a tres con `kubectl -n concertpass scale deployment/ticket-worker --replicas=3` cuando su imagen este disponible.
+Todos en `apps/scripts/`. Requieren la infraestructura creada (`setup`) y los pods desplegados (`deploy`).
+
+| Script | Uso |
+|---|---|
+| `lib.sh` | Funciones compartidas (no se ejecuta directamente). |
+| `evidence.sh` | Evidencia para el video: `rds`, `dynamodb`, `sqs`, `sqs-demo`, `reset`, `all`. |
+| `scenario-niche.sh` | Escenario de poca demanda: las 4 reservas terminan `confirmed`. |
+| `scenario-high-demand.sh` | Escenario de alta demanda con `--workers 3` por defecto: envia 60 reservas de `vip` (capacidad 50) y verifica que no hay sobreventa. |
+| `verify-teardown.sh` | Confirma con AWS CLI que `teardown.sh` elimino todos los recursos. |
+
+Ciclo completo para la demostracion:
+
+```bash
+bash apps/scripts/evidence.sh reset --yes
+bash apps/scripts/evidence.sh sqs-demo
+bash apps/scripts/scenario-niche.sh
+bash apps/scripts/scenario-high-demand.sh
+bash apps/scripts/evidence.sh all
+bash apps/scripts/teardown.sh --auto-approve
+bash apps/scripts/verify-teardown.sh
+```
 
 ## Comprobar infraestructura
 
@@ -73,9 +114,18 @@ kubectl get nodes
 kubectl -n concertpass get pods,services
 ```
 
-Validate exige exactamente dos nodos Ready, ejecuta un Job que comprueba el acceso del pod a SQS y DynamoDB, y valida contra el API de Kubernetes los tres manifiestos de aplicaciones mediante dry-run. El Job de setup demuestra la conexion de los pods a RDS y la estructura de la tabla. Esta comprobacion no valida la logica de reservaciones ni reemplaza las pruebas de los responsables de los servicios.
+Validate exige exactamente dos nodos Ready, ejecuta un Job que comprueba el acceso del pod a SQS y DynamoDB, y valida contra el API de Kubernetes los tres manifiestos de aplicaciones mediante dry-run. El Job de setup demuestra la conexion de los pods a RDS y la estructura de la tabla. Esta comprobacion no valida la logica de reservaciones; para eso estan los scripts de escenarios descritos arriba.
 
 Para consumir el API se usa `http://IP_PUBLICA_DE_UN_NODO:30080` despues de desplegar su imagen. Status muestra las direcciones de los nodos.
+
+## Escenarios de prueba
+
+El sistema se valida con dos escenarios que cubren los extremos del comportamiento esperado:
+
+- **Concierto de nicho** (`artista-nicho-cdmx`, capacidad `general = 8`): 4 reservas de 1 boleto. Todas terminan en `confirmed`. `scenario-niche.sh` lo ejecuta y verifica el resultado.
+- **Concierto de alta demanda** (`bad-bunny-gdl`, capacidad `vip = 50`): 60 reservas de 1 boleto con 3 replicas del worker. Las primeras 50 terminan en `booked`/`confirmed`; las 10 restantes en `rejected`. `scenario-high-demand.sh` lo ejecuta y verifica que no hay sobreventa (vendidos <= capacidad).
+
+El video de demostracion sigue este orden: `evidence.sh sqs-demo` (muestra el mensaje en SQS con su `MessageGroupId`), `scenario-niche.sh`, `scenario-high-demand.sh`, `evidence.sh all` (estado en RDS, DynamoDB y SQS), `teardown.sh`, y `verify-teardown.sh` (confirma que no quedan recursos).
 
 ## Eliminar recursos
 
