@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 sqs = boto3.client("sqs", region_name=os.environ["AWS_REGION"])
 
+
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS reservations (
     reservation_id UUID PRIMARY KEY,
@@ -23,6 +24,8 @@ CREATE TABLE IF NOT EXISTS reservations (
     created_at     TIMESTAMP NOT NULL,
     updated_at     TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS reservations_inventory_idx
+ON reservations (concert_id, ticket_type, status);
 """
 
 
@@ -116,3 +119,16 @@ def reserve(req: ReserveRequest):
         "concert_id": req.concert_id,
         "status": "pending",
     }
+
+@app.get("/reservation/{reservation_id}")
+def get_reservation(reservation_id: uuid.UUID):
+    conn = get_connection()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT concert_id, ticket_type, quantity, status FROM reservations WHERE reservation_id = %s", (str(reservation_id),))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    return {"reservation_id": str(reservation_id), "concert_id": row[0], "ticket_type": row[1], "quantity": row[2], "status": row[3]}
