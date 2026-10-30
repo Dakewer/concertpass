@@ -1,4 +1,5 @@
-apps/scripts/*.sh text eol=lf
-apps/scripts/*.py text eol=lf
-infra/*.tf text eol=lf
-k8s/*.yaml text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.tf text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf

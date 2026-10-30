@@ -68,6 +68,12 @@ check_empty "Security group del cluster"    aws_ ec2 describe-security-groups \
   --query 'SecurityGroups[].GroupId' --output text
 
 echo
+check_empty "Security group compartido nodos" aws_ ec2 describe-security-groups \
+  --filters "Name=group-name,Values=concertpass-nodes-*" \
+  --query 'SecurityGroups[].GroupId' --output text
+check_empty "Stacks activos de eksctl" aws_ cloudformation list-stacks \
+  --query "StackSummaries[?starts_with(StackName, 'eksctl-$CLUSTER-') && StackStatus!='DELETE_COMPLETE'].StackName" --output text
+
 echo "Datos y mensajeria"
 check_gone "RDS concertpass-db"             'DBInstanceNotFound' aws_ rds describe-db-instances --db-instance-identifier concertpass-db
 check_gone "SQS concertpass-reservations"   'NonExistentQueue|does not exist' aws_ sqs get-queue-url --queue-name concertpass-reservations.fifo
@@ -92,6 +98,7 @@ if [ "$FAILED" -eq 0 ] && [ "$UNKNOWN" -eq 0 ]; then
   echo "PASS: no queda ningun recurso del stack."
 elif [ "$FAILED" -eq 0 ]; then
   echo "Sin recursos detectados, pero $UNKNOWN comprobaciones no pudieron confirmarse (revisa los [?])."
+  exit 1
 else
   echo "FAIL: $FAILED recurso(s) siguen existiendo."
   exit 1

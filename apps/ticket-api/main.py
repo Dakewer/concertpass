@@ -8,7 +8,7 @@ import boto3
 import psycopg2
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 sqs = boto3.client("sqs", region_name=os.environ["AWS_REGION"])
 
@@ -56,10 +56,10 @@ app = FastAPI(title="ticket-api", lifespan=lifespan)
 
 
 class ReserveRequest(BaseModel):
-    concert_id: str
-    user_id: str
-    ticket_type: str
-    quantity: int
+    concert_id: str = Field(min_length=1, max_length=128)
+    user_id: str = Field(min_length=1)
+    ticket_type: str = Field(min_length=1)
+    quantity: int = Field(gt=0, strict=True)
 
 
 @app.post("/reserve")

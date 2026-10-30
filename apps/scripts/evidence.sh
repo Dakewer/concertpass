@@ -88,8 +88,28 @@ sqs_demo() {
   queue_attrs "$QUEUE_URL"
 
   step "4. Contenido del mensaje (visibility-timeout 0: solo se mira, no se consume)"
-  aws --region "$REGION" sqs receive-message --queue-url "$QUEUE_URL" --max-number-of-messages 1 \
-    --visibility-timeout 0 --wait-time-seconds 5 --attribute-names All --output json
+  local observed=0 message_file deadline_message=$((SECONDS + 90))
+  message_file="$(mktemp)"
+  while [ "$SECONDS" -lt "$deadline_message" ]; do
+    aws --region "$REGION" sqs receive-message --queue-url "$QUEUE_URL" --max-number-of-messages 10 \
+      --visibility-timeout 0 --wait-time-seconds 5 --message-system-attribute-names All --output json > "$message_file"
+    if python - "$message_file" "$id" <<'PYMESSAGE'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text() or '{}')
+for message in data.get('Messages', []):
+    body = json.loads(message['Body'])
+    if body.get('reservation_id') == sys.argv[2]:
+        assert message['Attributes']['MessageGroupId'] == body['concert_id']
+        print(json.dumps({'Body': body, 'Attributes': message['Attributes']}, indent=2))
+        sys.exit(0)
+sys.exit(1)
+PYMESSAGE
+    then observed=1; break; fi
+    sleep 2
+  done
+  rm -f "$message_file"
+  [ "$observed" -eq 1 ] || die "No se pudo observar el mensaje FIFO de esta reserva."
 
   step "5. Estado en RDS mientras no hay worker"
   db_query "SELECT reservation_id, concert_id, status FROM reservations WHERE reservation_id = '$id'"
@@ -106,6 +126,7 @@ sqs_demo() {
     sleep 2
   done
   log "GET /reservation/$id -> ${status:-sin-respuesta}"
+  [ "$status" = "confirmed" ] || die "La reserva de demostracion no termino en confirmed."
   queue_attrs "$QUEUE_URL"
 }
 
@@ -113,14 +134,14 @@ reset_all() {
   local assume_yes=0
   [ "${1:-}" = "--yes" ] && assume_yes=1
   if [ "$assume_yes" -ne 1 ]; then
-    read -r -p "Esto borra TODAS las reservaciones y purga las colas. ¿Continuar? [s/N] " answer
+    read -r -p "Esto borra TODAS las reservaciones y purga las colas. Â¿Continuar? [s/N] " answer
     case "$answer" in s|S|si|SI|y|Y) ;; *) log "Cancelado."; return 0 ;; esac
   fi
   step "Borrando reservaciones en RDS"
   db_query "DELETE FROM reservations"
   step "Purgando colas SQS (SQS solo permite una purga por minuto)"
-  aws --region "$REGION" sqs purge-queue --queue-url "$QUEUE_URL" || warn "No se pudo purgar la cola principal."
-  aws --region "$REGION" sqs purge-queue --queue-url "$(dlq_url)" || warn "No se pudo purgar la DLQ."
+  aws --region "$REGION" sqs purge-queue --queue-url "$QUEUE_URL"
+  aws --region "$REGION" sqs purge-queue --queue-url "$(dlq_url)"
 }
 
 case "$cmd" in -h|--help) usage_from_header "$0"; exit 0 ;; esac

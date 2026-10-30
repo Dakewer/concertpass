@@ -40,58 +40,98 @@ locals {
   }
 }
 
-# LabRole already trusts EKS/EC2 and has the lab policies. Terraform never edits it.
-resource "aws_eks_cluster" "main" {
-  name     = var.cluster_name
-  version  = var.kubernetes_version
-  role_arn = data.aws_iam_role.cluster.arn
-  vpc_config {
-    subnet_ids              = local.subnet_ids
-    endpoint_private_access = true
-    endpoint_public_access  = true
-  }
-  access_config {
-    authentication_mode                         = "API_AND_CONFIG_MAP"
-    bootstrap_cluster_creator_admin_permissions = true
-  }
+# Terraform owns this lifecycle; eksctl creates the cluster and its two nodes.
+# Existing LabRole and the default VPC are reused without changing IAM.
+data "aws_subnet" "selected" {
+  for_each = toset(local.subnet_ids)
+  id       = each.value
 }
-resource "aws_launch_template" "nodes" {
+
+resource "aws_security_group" "nodes" {
   name_prefix = "concertpass-nodes-"
-  metadata_options {
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+  description = "Shared EKS node group managed by Terraform"
+  vpc_id      = data.aws_vpc.default.id
+  ingress {
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    self      = true
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 }
-resource "aws_eks_node_group" "main" {
-  cluster_name    = aws_eks_cluster.main.name
-  node_group_name = "concertpass-workers"
-  node_role_arn   = data.aws_iam_role.nodes.arn
-  subnet_ids      = local.subnet_ids
-  instance_types  = [var.node_instance_type]
-  ami_type        = "AL2023_x86_64_STANDARD"
-  launch_template {
-    id      = aws_launch_template.nodes.id
-    version = aws_launch_template.nodes.latest_version
-  }
-  scaling_config {
-    desired_size = 2
-    min_size     = 2
-    max_size     = 2
-  }
-  update_config {
-    max_unavailable = 1
+
+locals {
+  eksctl_config = {
+    apiVersion = "eksctl.io/v1alpha5"
+    kind       = "ClusterConfig"
+    metadata = {
+      name = var.cluster_name, region = var.region, version = var.kubernetes_version
+      tags = { Project = "concertpass", ManagedBy = "Terraform-eksctl" }
+    }
+    iam = { serviceRoleARN = data.aws_iam_role.cluster.arn, withOIDC = false }
+    accessConfig = {
+      authenticationMode                      = "API_AND_CONFIG_MAP"
+      bootstrapClusterCreatorAdminPermissions = true
+    }
+    autoModeConfig = { enabled = false }
+    vpc = {
+      id                                 = data.aws_vpc.default.id
+      subnets                            = { public = { for subnet in data.aws_subnet.selected : subnet.availability_zone => { id = subnet.id } } }
+      clusterEndpoints                   = { privateAccess = true, publicAccess = true }
+      sharedNodeSecurityGroup            = aws_security_group.nodes.id
+      manageSharedNodeSecurityGroupRules = false
+    }
+    managedNodeGroups = [{
+      name              = "concertpass-workers"
+      instanceType      = var.node_instance_type
+      amiFamily         = "AmazonLinux2023"
+      minSize           = 2, maxSize = 2, desiredCapacity = 2
+      privateNetworking = false
+      disableIMDSv1     = true
+      disablePodIMDS    = false
+      iam               = { instanceRoleARN = data.aws_iam_role.nodes.arn }
+      securityGroups    = { attachIDs = [aws_security_group.nodes.id] }
+    }]
+    addons = [for name in ["vpc-cni", "coredns", "kube-proxy"] : { name = name }]
   }
 }
-resource "aws_eks_addon" "system" {
-  for_each                    = toset(["vpc-cni", "kube-proxy", "coredns"])
-  cluster_name                = aws_eks_cluster.main.name
-  addon_name                  = each.value
-  resolve_conflicts_on_create = "OVERWRITE"
-  depends_on                  = [aws_eks_node_group.main]
+
+resource "terraform_data" "eksctl" {
+  input            = { config = jsonencode(local.eksctl_config) }
+  triggers_replace = [sha256(jsonencode(local.eksctl_config))]
+
+  provisioner "local-exec" {
+    interpreter = ["python", "-c"]
+    command     = "import runpy; runpy.run_path('../apps/scripts/eks_cluster.py', run_name='__main__')"
+    environment = {
+      CONCERTPASS_CLUSTER_CONFIG = self.input.config
+      CONCERTPASS_CLUSTER_ACTION = "create"
+    }
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["python", "-c"]
+    command     = "import runpy; runpy.run_path('../apps/scripts/eks_cluster.py', run_name='__main__')"
+    environment = {
+      CONCERTPASS_CLUSTER_CONFIG = self.input.config
+      CONCERTPASS_CLUSTER_ACTION = "delete"
+    }
+  }
 }
+
+data "aws_eks_cluster" "runtime" {
+  name       = var.cluster_name
+  depends_on = [terraform_data.eksctl]
+}
+
 resource "aws_vpc_security_group_ingress_rule" "api_nodeport" {
-  security_group_id = aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+  security_group_id = data.aws_eks_cluster.runtime.vpc_config[0].cluster_security_group_id
   cidr_ipv4         = var.api_allowed_cidr
   from_port         = 30080
   to_port           = 30080
@@ -111,7 +151,7 @@ resource "aws_security_group" "db" {
     from_port       = 5432
     to_port         = 5432
     protocol        = "tcp"
-    security_groups = [aws_eks_cluster.main.vpc_config[0].cluster_security_group_id]
+    security_groups = [aws_security_group.nodes.id]
   }
 }
 resource "aws_db_subnet_group" "main" {

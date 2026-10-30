@@ -63,6 +63,9 @@ def book_or_reject(conn, reservation_id, concert_id, ticket_type, quantity):
     capacity = get_capacity(concert_id, ticket_type)
 
     with conn, conn.cursor() as cur:
+        # Serialize this inventory before taking a fresh READ COMMITTED snapshot.
+        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (json.dumps([concert_id, ticket_type]),))
         cur.execute(LOCK_AND_COUNT_SQL, (concert_id, ticket_type))
         sold = cur.fetchone()[0]
         if sold + quantity <= capacity:

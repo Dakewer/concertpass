@@ -1,0 +1,342 @@
+
+>>> Infraestructura y acceso AWS
++ terraform -chdir=C:\Users\emmanuel\Documents\desarrollo de software\Desarrollo en la Nube (AWS)\concertpass\infra output -json
++ aws --region us-east-1 eks update-kubeconfig --name concertpass --kubeconfig C:\Users\emmanuel\Documents\desarrollo de software\Desarrollo en la Nube (AWS)\concertpass\infra\.generated\kubeconfig
+Updated context arn:aws:eks:us-east-1:647018795197:cluster/concertpass in C:\Users\emmanuel\Documents\desarrollo de software\Desarrollo en la Nube (AWS)\concertpass\infra\.generated\kubeconfig
++ kubectl --namespace=concertpass get nodes -o json
++ kubectl --namespace=concertpass delete job aws-infrastructure-check --ignore-not-found=true --wait=true
+job.batch "aws-infrastructure-check" deleted from concertpass namespace
++ kubectl --namespace=concertpass apply -f C:\Users\emmanuel\Documents\desarrollo de software\Desarrollo en la Nube (AWS)\concertpass\k8s\validate-aws.yaml
+job.batch/aws-infrastructure-check created
++ kubectl --namespace=concertpass wait --for=condition=complete job/aws-infrastructure-check --timeout=300s
+job.batch/aws-infrastructure-check condition met
++ kubectl --namespace=concertpass logs job/aws-infrastructure-check --all-containers=true
+arn:aws:sts::647018795197:assumed-role/LabRole/i-0a53f1f6e073d7d4a
+{
+    "Attributes": {
+        "FifoQueue": "true",
+        "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:us-east-1:647018795197:concertpass-reservations-dlq.fifo\",\"maxReceiveCount\":5}"
+    }
+}
+Conciertos precargados: 2
+{
+    "Item": {
+        "capacity": {
+            "M": {
+                "floor": {
+                    "N": "100"
+                },
+                "general": {
+                    "N": "500"
+                },
+                "vip": {
+                    "N": "50"
+                }
+            }
+        }
+    }
+}
++ kubectl --namespace=concertpass apply --dry-run=server -f -
+deployment.apps/ticket-api configured (server dry run)
+service/ticket-api unchanged (server dry run)
++ kubectl --namespace=concertpass apply --dry-run=server -f -
+deployment.apps/ticket-worker configured (server dry run)
++ kubectl --namespace=concertpass apply --dry-run=server -f -
+deployment.apps/ticket-checkout configured (server dry run)
+service/ticket-checkout unchanged (server dry run)
+Infraestructura verificada: 2 nodos Ready, acceso pod a AWS y manifiestos validos.
+PASS: Infraestructura y acceso AWS
+
+>>> Pausar consumidor para reiniciar datos
+deployment.apps/ticket-worker scaled
+PASS: Pausar consumidor para reiniciar datos
+
+>>> Esperar detencion del consumidor
+pod/ticket-worker-589567d567-xqhtx condition met
+PASS: Esperar detencion del consumidor
+
+>>> Reiniciar datos de demostracion
+
+== Borrando reservaciones en RDS ==
+OK (68 filas afectadas)
+
+== Purgando colas SQS (SQS solo permite una purga por minuto) ==
+PASS: Reiniciar datos de demostracion
+Esperando purga SQS: 60 segundos...
+Esperando purga SQS: 50 segundos...
+Esperando purga SQS: 40 segundos...
+Esperando purga SQS: 30 segundos...
+Esperando purga SQS: 20 segundos...
+Esperando purga SQS: 10 segundos...
+deployment.apps/ticket-worker scaled
+
+>>> Mensaje FIFO y reserva confirmada
+API: http://52.72.201.182:30080
+
+== 1. Deteniendo ticket-worker para que el mensaje se quede en la cola ==
+deployment.apps/ticket-worker scaled
+pod/ticket-worker-589567d567-pmnn2 condition met
+NAME                               READY   STATUS      RESTARTS   AGE
+aws-infrastructure-check-8t7fr     0/1     Completed   0          3m58s
+ticket-api-7887946564-f7cr9        1/1     Running     0          4m55s
+ticket-api-7887946564-rqzd9        1/1     Running     0          5m1s
+ticket-checkout-644898bd66-sf6s6   1/1     Running     0          4m56s
+
+== 2. POST /reserve ==
+{"concert_id":"bad-bunny-gdl","user_id":"usr_demo_sqs","ticket_type":"general","quantity":1}
+HTTP 200  {"reservation_id":"ea26deee-fcc9-4acc-a5df-438c7be35ce6","concert_id":"bad-bunny-gdl","status":"pending"}
+
+== 3. El mensaje esta en la cola (el conteo de SQS es aproximado, espera unos segundos) ==
+{
+    "ApproximateNumberOfMessages": "0",
+    "ApproximateNumberOfMessagesNotVisible": "1",
+    "ApproximateNumberOfMessagesDelayed": "0",
+    "FifoQueue": "true"
+}
+
+== 4. Contenido del mensaje (visibility-timeout 0: solo se mira, no se consume) ==
+{
+  "Body": {
+    "reservation_id": "ea26deee-fcc9-4acc-a5df-438c7be35ce6",
+    "concert_id": "bad-bunny-gdl",
+    "user_id": "usr_demo_sqs",
+    "ticket_type": "general",
+    "quantity": 1
+  },
+  "Attributes": {
+    "SenderId": "AROAZNJKTKC6WWTSMUOID:i-0a53f1f6e073d7d4a",
+    "ApproximateFirstReceiveTimestamp": "1793328023644",
+    "ApproximateReceiveCount": "2",
+    "SentTimestamp": "1793328023644",
+    "SequenceNumber": "18905836047762415616",
+    "MessageDeduplicationId": "ea26deee-fcc9-4acc-a5df-438c7be35ce6",
+    "MessageGroupId": "bad-bunny-gdl"
+  }
+}
+
+== 5. Estado en RDS mientras no hay worker ==
+reservation_id                       | concert_id    | status 
+-------------------------------------+---------------+--------
+ea26deee-fcc9-4acc-a5df-438c7be35ce6 | bad-bunny-gdl | pending
+(1 filas)
+
+== 6. Encendiendo ticket-worker de nuevo ==
+deployment.apps/ticket-worker scaled
+Waiting for deployment "ticket-worker" rollout to finish: 0 of 1 updated replicas are available...
+deployment "ticket-worker" successfully rolled out
+GET /reservation/ea26deee-fcc9-4acc-a5df-438c7be35ce6 -> confirmed
+{
+    "ApproximateNumberOfMessages": "0",
+    "ApproximateNumberOfMessagesNotVisible": "0",
+    "ApproximateNumberOfMessagesDelayed": "0",
+    "FifoQueue": "true"
+}
+PASS: Mensaje FIFO y reserva confirmada
+
+>>> Cuatro reservas de nicho
+API: http://52.72.201.182:30080
+
+== Estado inicial de artista-nicho-cdmx / general ==
+Capacidad (DynamoDB): 8   Ya vendidos (RDS): 0   Disponibles: 8
+
+== Enviando 4 reservaciones (POST /reserve) ==
+  #1 -> 6441cde1-904c-451a-b407-18c7844755a8
+  #2 -> 5c1a0ab6-1768-467e-bf9f-1951a505d716
+  #3 -> 733431da-8398-4f8a-9439-791712ba04ec
+  #4 -> 98e3a15a-3a40-484f-9664-7425e8517ae9
+
+== Esperando estado final (GET /reservation/{id}) ==
+  6441cde1-904c-451a-b407-18c7844755a8 -> confirmed
+  5c1a0ab6-1768-467e-bf9f-1951a505d716 -> confirmed
+  733431da-8398-4f8a-9439-791712ba04ec -> confirmed
+  98e3a15a-3a40-484f-9664-7425e8517ae9 -> confirmed
+
+== Evidencia en RDS ==
+reservation_id                       | user_id                | ticket_type | quantity | status   
+-------------------------------------+------------------------+-------------+----------+----------
+6441cde1-904c-451a-b407-18c7844755a8 | usr_nicho_1793328104_1 | general     | 1        | confirmed
+5c1a0ab6-1768-467e-bf9f-1951a505d716 | usr_nicho_1793328104_2 | general     | 1        | confirmed
+733431da-8398-4f8a-9439-791712ba04ec | usr_nicho_1793328104_3 | general     | 1        | confirmed
+98e3a15a-3a40-484f-9664-7425e8517ae9 | usr_nicho_1793328104_4 | general     | 1        | confirmed
+(4 filas)
+
+== Evidencia en DynamoDB (capacidad del concierto) ==
+{
+    "concert_id": "artista-nicho-cdmx",
+    "name": "Artista de nicho",
+    "recinto": "Foro Indie, CDMX",
+    "capacity": {
+        "floor": "4",
+        "vip": "3",
+        "general": "8"
+    }
+}
+
+== Resultado ==
+PASS: las 4 reservaciones terminaron en confirmed.
+PASS: Cuatro reservas de nicho
+
+>>> 60 solicitudes y tres workers
+API: http://52.72.201.182:30080
+
+== Escalando ticket-worker a 3 replicas (antes: 1) ==
+deployment.apps/ticket-worker scaled
+Waiting for deployment "ticket-worker" rollout to finish: 2 of 3 updated replicas are available...
+deployment "ticket-worker" successfully rolled out
+NAME                             READY   STATUS    RESTARTS   AGE   IP              NODE                            NOMINATED NODE   READINESS GATES
+ticket-worker-589567d567-gp599   1/1     Running   0          3s    172.31.19.219   ip-172-31-30-226.ec2.internal   <none>           <none>
+ticket-worker-589567d567-lfj65   1/1     Running   0          35s   172.31.30.185   ip-172-31-30-226.ec2.internal   <none>           <none>
+ticket-worker-589567d567-nszh8   1/1     Running   0          3s    172.31.15.59    ip-172-31-8-156.ec2.internal    <none>           <none>
+
+== Estado inicial de bad-bunny-gdl / vip ==
+Capacidad (DynamoDB): 50   Ya vendidos (RDS): 0   Disponibles: 50
+Se enviaran 60 reservaciones de 1 boleto(s) = 60 boletos solicitados
+
+== Enviando 60 reservaciones con 20 peticiones en paralelo ==
+Peticiones aceptadas por la API (HTTP 200): 60   con error: 0   (~30 req/s, 2s)
+
+== Procesamiento del worker (consulta a RDS cada 3 s) ==
+  confirmed=50   rejected=10
+
+== Resultado por estado (solo esta corrida) ==
+status    | reservas | boletos
+----------+----------+--------
+confirmed | 50       | 50     
+rejected  | 10       | 10     
+(2 filas)
+
+== Ejemplos de reservaciones rejected en RDS ==
+reservation_id                       | user_id           | quantity | status   | updated_at                
+-------------------------------------+-------------------+----------+----------+---------------------------
+00793a0e-6a9e-42fe-8499-12d0444a9097 | usr_1793328126_51 | 1        | rejected | 2026-10-30 02:42:07.807843
+78d6e3c0-bd6d-4426-9d8e-1a9264b2a3b3 | usr_1793328126_52 | 1        | rejected | 2026-10-30 02:42:07.829358
+508b6f2a-aa61-4510-b3b3-689acabf52ed | usr_1793328126_53 | 1        | rejected | 2026-10-30 02:42:07.870011
+fa1aae01-3a2b-4a7d-a26f-3ee351534ab3 | usr_1793328126_54 | 1        | rejected | 2026-10-30 02:42:07.886955
+3b6ee2e1-e5a1-4a65-8b54-138078f5a96f | usr_1793328126_55 | 1        | rejected | 2026-10-30 02:42:07.935067
+b2aafe99-c9ce-49df-b5bd-586b6dc6cd39 | usr_1793328126_56 | 1        | rejected | 2026-10-30 02:42:07.956735
+c30a000d-96fc-46d5-a5f7-94e13bec92de | usr_1793328126_57 | 1        | rejected | 2026-10-30 02:42:08.000365
+e1b48a21-e963-4766-8e7e-56fc02990f90 | usr_1793328126_58 | 1        | rejected | 2026-10-30 02:42:08.042140
+(8 filas)
+
+== Verificacion de no sobreventa ==
+Vendidos (booked + confirmed) = 50   Capacidad = 50
+OK: no hay sobreventa (50 <= 50).
+OK: se vendieron exactamente los boletos esperados (50).
+
+== Resultado ==
+PASS
+
+== Restaurando ticket-worker a 1 replica(s) ==
+deployment.apps/ticket-worker scaled
+PASS: 60 solicitudes y tres workers
+
+>>> Operaciones del worker
+Found 3 pods, using pod/ticket-worker-589567d567-lfj65
+2026-10-30 02:42:07,204 INFO Reservation 49009455-1950-4a56-84be-cc3b4cf52303 (bad-bunny-gdl x1 vip): booked
+2026-10-30 02:42:07,213 INFO Reservation 49009455-1950-4a56-84be-cc3b4cf52303: confirmed
+2026-10-30 02:42:07,231 INFO Reservation 7d0ea0a5-415e-4df0-9e10-010839ebe25b (bad-bunny-gdl x1 vip): booked
+2026-10-30 02:42:07,240 INFO Reservation 7d0ea0a5-415e-4df0-9e10-010839ebe25b: confirmed
+2026-10-30 02:42:07,385 INFO Reservation 2949e57f-3165-4c2d-972d-f1387e0620e2 (bad-bunny-gdl x1 vip): booked
+2026-10-30 02:42:07,394 INFO Reservation 2949e57f-3165-4c2d-972d-f1387e0620e2: confirmed
+2026-10-30 02:42:07,411 INFO Reservation 6109e952-9086-45c3-91fa-d43751b27d4a (bad-bunny-gdl x1 vip): booked
+2026-10-30 02:42:07,420 INFO Reservation 6109e952-9086-45c3-91fa-d43751b27d4a: confirmed
+2026-10-30 02:42:07,642 INFO Reservation f37ca01a-0636-40fc-a013-f13e36f48707 (bad-bunny-gdl x1 vip): booked
+2026-10-30 02:42:07,651 INFO Reservation f37ca01a-0636-40fc-a013-f13e36f48707: confirmed
+2026-10-30 02:42:07,668 INFO Reservation 644c3504-fcc7-4db9-b301-d254f283a706 (bad-bunny-gdl x1 vip): booked
+2026-10-30 02:42:07,678 INFO Reservation 644c3504-fcc7-4db9-b301-d254f283a706: confirmed
+2026-10-30 02:42:07,869 INFO Reservation 508b6f2a-aa61-4510-b3b3-689acabf52ed (bad-bunny-gdl x1 vip): rejected
+2026-10-30 02:42:07,886 INFO Reservation fa1aae01-3a2b-4a7d-a26f-3ee351534ab3 (bad-bunny-gdl x1 vip): rejected
+2026-10-30 02:42:08,041 INFO Reservation e1b48a21-e963-4766-8e7e-56fc02990f90 (bad-bunny-gdl x1 vip): rejected
+PASS: Operaciones del worker
+
+>>> Autorizaciones HTTP de checkout
+INFO:     172.31.15.59:42308 - "POST /checkout HTTP/1.1" 200 OK
+INFO:     172.31.15.59:42320 - "POST /checkout HTTP/1.1" 200 OK
+INFO:     172.31.19.219:58140 - "POST /checkout HTTP/1.1" 200 OK
+INFO:     172.31.19.219:58148 - "POST /checkout HTTP/1.1" 200 OK
+INFO:     172.31.30.185:55692 - "POST /checkout HTTP/1.1" 200 OK
+INFO:     172.31.30.185:55704 - "POST /checkout HTTP/1.1" 200 OK
+INFO:     172.31.15.59:42330 - "POST /checkout HTTP/1.1" 200 OK
+INFO:     172.31.15.59:42338 - "POST /checkout HTTP/1.1" 200 OK
+PASS: Autorizaciones HTTP de checkout
+
+>>> Evidencia RDS, DynamoDB y SQS
+
+== DynamoDB: tabla concert-events ==
+[
+    {
+        "concert_id": "artista-nicho-cdmx",
+        "name": "Artista de nicho",
+        "date": "2026-12-05",
+        "recinto": "Foro Indie, CDMX",
+        "capacity": {
+            "floor": "4",
+            "vip": "3",
+            "general": "8"
+        }
+    },
+    {
+        "concert_id": "bad-bunny-gdl",
+        "name": "Bad Bunny Debi tirar mas fotos",
+        "date": "2026-11-15",
+        "recinto": "Estadio Akron, GDL",
+        "capacity": {
+            "floor": "100",
+            "vip": "50",
+            "general": "500"
+        }
+    }
+]
+
+== RDS: resumen por concierto / tipo / estado ==
+concert_id         | ticket_type | status    | reservas | boletos
+-------------------+-------------+-----------+----------+--------
+artista-nicho-cdmx | general     | confirmed | 4        | 4      
+bad-bunny-gdl      | general     | confirmed | 1        | 1      
+bad-bunny-gdl      | vip         | confirmed | 50       | 50     
+bad-bunny-gdl      | vip         | rejected  | 10       | 10     
+(4 filas)
+
+== RDS: ultimas 10 reservaciones ==
+reservation_id                       | concert_id    | ticket_type | quantity | status   | created_at                
+-------------------------------------+---------------+-------------+----------+----------+---------------------------
+bcdd3fd8-054b-48c0-9c7a-64cfceeae412 | bad-bunny-gdl | vip         | 1        | rejected | 2026-10-30 02:42:08.048180
+ffa9b664-54c4-4bdc-85ca-7faab0c56540 | bad-bunny-gdl | vip         | 1        | rejected | 2026-10-30 02:42:08.001049
+e1b48a21-e963-4766-8e7e-56fc02990f90 | bad-bunny-gdl | vip         | 1        | rejected | 2026-10-30 02:42:07.971489
+c30a000d-96fc-46d5-a5f7-94e13bec92de | bad-bunny-gdl | vip         | 1        | rejected | 2026-10-30 02:42:07.928694
+b2aafe99-c9ce-49df-b5bd-586b6dc6cd39 | bad-bunny-gdl | vip         | 1        | rejected | 2026-10-30 02:42:07.860071
+3b6ee2e1-e5a1-4a65-8b54-138078f5a96f | bad-bunny-gdl | vip         | 1        | rejected | 2026-10-30 02:42:07.830313
+fa1aae01-3a2b-4a7d-a26f-3ee351534ab3 | bad-bunny-gdl | vip         | 1        | rejected | 2026-10-30 02:42:07.797544
+508b6f2a-aa61-4510-b3b3-689acabf52ed | bad-bunny-gdl | vip         | 1        | rejected | 2026-10-30 02:42:07.749678
+78d6e3c0-bd6d-4426-9d8e-1a9264b2a3b3 | bad-bunny-gdl | vip         | 1        | rejected | 2026-10-30 02:42:07.715211
+00793a0e-6a9e-42fe-8499-12d0444a9097 | bad-bunny-gdl | vip         | 1        | rejected | 2026-10-30 02:42:07.675016
+(10 filas)
+
+== SQS: cola principal (https://sqs.us-east-1.amazonaws.com/647018795197/concertpass-reservations.fifo) ==
+{
+    "ApproximateNumberOfMessages": "0",
+    "ApproximateNumberOfMessagesNotVisible": "0",
+    "ApproximateNumberOfMessagesDelayed": "0",
+    "FifoQueue": "true"
+}
+
+== SQS: cola de mensajes fallidos (DLQ) ==
+{
+    "ApproximateNumberOfMessages": "0",
+    "ApproximateNumberOfMessagesNotVisible": "0",
+    "ApproximateNumberOfMessagesDelayed": "0",
+    "FifoQueue": "true"
+}
+PASS: Evidencia RDS, DynamoDB y SQS
+
+RESULTADO DE LA DEMOSTRACION
+PASS - Infraestructura y acceso AWS
+PASS - Pausar consumidor para reiniciar datos
+PASS - Esperar detencion del consumidor
+PASS - Reiniciar datos de demostracion
+PASS - Mensaje FIFO y reserva confirmada
+PASS - Cuatro reservas de nicho
+PASS - 60 solicitudes y tres workers
+PASS - Operaciones del worker
+PASS - Autorizaciones HTTP de checkout
+PASS - Evidencia RDS, DynamoDB y SQS

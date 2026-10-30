@@ -2,7 +2,7 @@ output "region" {
   value = var.region
 }
 output "cluster_name" {
-  value = aws_eks_cluster.main.name
+  value = var.cluster_name
 }
 output "account_id" {
   value = data.aws_caller_identity.current.account_id
@@ -21,4 +21,8 @@ output "ecr_urls" {
 }
 output "node_role_arn" {
   value = data.aws_iam_role.nodes.arn
+}
+
+output "eksctl_stack_names" {
+  value = ["eksctl-${var.cluster_name}-cluster", "eksctl-${var.cluster_name}-nodegroup-concertpass-workers"]
 }

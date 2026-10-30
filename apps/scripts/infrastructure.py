@@ -34,6 +34,8 @@ def terraform(*args, **kwargs):
 
 
 def outputs():
+    if os.environ.get("CONCERTPASS_RUNTIME_CONFIG"):
+        return json.loads(os.environ["CONCERTPASS_RUNTIME_CONFIG"])
     result = json.loads(terraform("output", "-json", capture=True).stdout)
     if not result:
         raise RuntimeError("No hay infraestructura creada. Ejecuta setup primero.")
@@ -137,6 +139,15 @@ def images(args):
     password = aws(config, "ecr", "get-login-password", capture=True).stdout
     run(["docker", "login", "--username", "AWS", "--password-stdin", registry], stdin=password)
     for service in args.services:
+        existing = subprocess.run(["aws", "--region", config["region"], "ecr", "describe-images",
+                                   "--repository-name", "concertpass/" + service,
+                                   "--image-ids", "imageTag=" + args.tag],
+                                  env=ENV, text=True, capture_output=True)
+        if existing.returncode == 0:
+            print("Imagen inmutable ya publicada: " + service + ":" + args.tag, flush=True)
+            continue
+        if "ImageNotFoundException" not in existing.stderr:
+            raise RuntimeError(existing.stderr.strip())
         image = config["ecr_urls"][service] + ":" + args.tag
         run(["docker", "build", "--platform=linux/amd64", "-t", image, ROOT / "apps" / service])
         run(["docker", "push", image])

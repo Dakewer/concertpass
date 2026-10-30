@@ -1,0 +1,179 @@
+Práctica 3: Concertpass
+Fecha de entrega: 29 de octubre de 2026
+Fecha de entrega flexible: 90/100 antes del 31-10-2026. 80/100 antes del 05-11-2026
+1 Descripción de la actividad
+• En equipo
+TicketMaster, BoletaNet, Eventbrite. Cuando se anuncia un concierto popular, miles de personas intentan comprar boletos al mismo tiempo. El sistema tiene que recibir esa carga, procesar las reservaciones en orden y garantizar que no se venda más del aforo disponible.
+Para esta práctica construyes Concertpass: un sistema de reservación de boletos para conciertos compuesto por tres microservicios desplegados en un cluster de Kubernetes de AWS EKS.
+1.1 Dos escenarios de prueba
+Concierto de nicho: tiene poca demanda. Todos los usuarios que reservan obtienen su boleto. El sistema responde sin presión.
+Escenario de alta demanda: Hay muchos usuarios que envían más reservaciones de las que hay boletos disponibles. Los primeros en llegar obtienen su boleto, el resto recibe rejected. El comportamiento del sistema bajo carga es parte de lo que debes mostrar en el video.
+1.2 Los tres servicios
+Cada microservicio debe ser un pod en el cluster. Los manifiestos necesarios deben estar en el repositorio de github de la entrega.
+ticket-api API que recibe solicitudes de reservación, las encola en SQS FIFO y permite consultar el estado. Tiene los siguientes endpoints.
+Endpoint
+Descripción
+POST /reserve
+Registra la reservación en RDS con estado pending, encola el mensaje en SQS y regresa reservation_id
+GET /reservation/{id}
+Regresa el estado actual: pending, booked, confirmed o rejected
+ticket-worker Consume mensajes de SQS FIFO haciendo polling. Para cada reservación: consulta la capacidad del concierto en DynamoDB, calcula cuántos boletos del mismo tipo ya están vendidos en RDS, y decide si hay espacio. Si hay espacio, actualiza el estado a booked y notifica a ticket-checkout. Si no hay espacio, actualiza el estado a rejected. Al recibir confirmación de ticket-checkout, actualiza el estado a confirmed.
+ticket-checkout API que simula un sistema de pagos externo (como la API de Stripe o PayPal). Tiene el siguiente endpoint.
+Endpoint
+Descripción
+POST /checkout
+Recibe una solicitud de pago, responde 200 OK autorizando la compra
+En un sistema real, esta llamada sería a la API del procesador de pagos y la confirmación llegaría por webhook; aquí la respuesta es inmediata para simplificar.
+1.3 Estado de una reservación
+pending -> booked -> confirmed -> rejected
+ticket-worker actualiza el estado a confirmed en cuanto ticket-checkout responde.
+El cliente consulta el estado final con GET /reservation/{id}.
+1.4 Body de POST /reserve de ticket-api
+{
+  "concert_id":  "bad-bunny-gdl",
+  "user_id":     "usr_123",
+  "ticket_type": "vip",
+  "quantity":    2
+}
+Una reservación corresponde a un único tipo de boleto. Si el usuario quiere boletos de sección floor y de sección vip, hace dos llamadas separadas.
+1.5 Body de POST /checkout de ticket-checkout
+{
+  "reservation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "quantity":       2
+}
+Cuando ticket-checkout responde 200 OK, ticket-worker actualiza el estado de la reservación a confirmed en RDS.
+1.6 Bases de datos
+DynamoDB — definición del evento
+Solo lectura en runtime. Contiene la información del evento: nombre, fecha, recinto y capacidad máxima por sección. Precarga al menos dos conciertos con capacidades distintas, puedes utilizar un script. De esta forma vas a poder validar la aplicación.
+Por ejemplo:
+{
+  "concert_id": "bad-bunny-gdl",
+  "name":       "Bad Bunny Debi tirar más fotos",
+  "date":       "2026-11-15",
+  "recinto":    "Estadio Akron, GDL",
+  "capacity": {
+    "floor":   100,
+    "vip":     50,
+    "general": 500
+  }
+}
+RDS PostgreSQL — reservaciones
+reservations (
+  reservation_id  UUID       PRIMARY KEY,
+  concert_id      VARCHAR    NOT NULL,
+  user_id         VARCHAR    NOT NULL,
+  ticket_type     VARCHAR    NOT NULL,
+  quantity        INTEGER    NOT NULL,
+  status          VARCHAR    NOT NULL,
+  created_at      TIMESTAMP  NOT NULL,
+  updated_at      TIMESTAMP  NOT NULL
+)
+Para verificar disponibilidad de forma segura con múltiples workers, ticket-worker ejecuta esta transacción:
+BEGIN;
+
+SELECT COALESCE(SUM(quantity), 0)
+FROM   reservations
+WHERE  concert_id  = :concert_id
+AND    ticket_type = :ticket_type
+AND    status IN ('booked', 'confirmed')
+FOR UPDATE;  -- Bloquea para evitar race condition entre workers
+
+-- Lógica de verificación:
+-- Si suma + quantity_solicitada <= capacity[ticket_type], hay espacio:
+
+UPDATE reservations
+SET status = 'booked', updated_at = NOW()
+WHERE reservation_id = :reservation_id;
+
+COMMIT;
+
+-- Si NO hay espacio (suma + quantity > capacity):
+ROLLBACK;
+El FOR UPDATE es crucial: impide que otros workers lean la disponibilidad simultáneamente mientras esta transacción está activa. Si no hay espacio, el ROLLBACK libera el bloqueo sin actualizar nada, y ticket-worker actualiza el estado a rejected en una transacción separada.
+1.7 Infraestructura del cluster
+Utiliza el comando eksctl para levantar un cluster de kubernetes con 2 workers en Amazon EKS. Asegúrate de que la configuración de kubectl es correcta, para esto corre kubectl get nodes y debes ver los dos nodos. Si no funciona correctamente investiga si la configuración de kubectl (kubeconfig) es correcta.
+Escribe los manifiestos para los servicios de kubernetes eligiendo el tipo de recurso apropiado y despliégalos con kubectl apply.
+Nota: Recuerda eliminar el cluster con teardown.sh al terminar de trabajar la práctica ya que EKS es un servicio costoso.
+1.8 SQS FIFO y serialización por concierto
+La queue usa concert_id como MessageGroupId. Esto garantiza que todas las reservaciones del mismo concierto se procesen en orden. Sin embargo, SQS FIFO por sí solo no evita race conditions: múltiples workers pueden leer de la base de datos simultáneamente y ver la misma disponibilidad. Por eso el FOR UPDATE en la transacción de PostgreSQL es mandatorio.
+ticket-api puede escalar horizontalmente (más réplicas = más capacidad para recibir y encolar solicitudes). ticket-worker también puede escalar con el FOR UPDATE adecuado. El cuello de botella está en la lógica de inventario (lectura + bloqueo + escritura), no en la recepción de requests. Reflexiona sobre esto en tu reporte.
+1.9 Secrets Manager
+Guarda las credenciales de RDS en AWS Secrets Manager. Los tres servicios leen su configuración (host de RDS, URL de SQS, región, etc.) exclusivamente desde variables de entorno. Ningún valor de configuración va hardcodeado en el código.
+1.10 Scripts de bash
+La infraestructura se levanta con scripts de bash guardados en concertpass/apps/scripts/, cada uno con su contraparte de destrucción en teardown.sh.
+Utiliza scripts para crear el cluster, sqs, rds, dynamodb y otros recursos necesarios. También haz scripts para apoyarte a validar los dos escenarios de uso, pocos requests vs muchos requests.
+1.11 Estructura del repositorio
+concertpass/
+├── ticket-api/
+│   ├── Dockerfile
+│   ├── src/
+│   └── requirements.txt
+├── ticket-worker/
+│   ├── Dockerfile
+│   └── src/
+├── ticket-checkout/
+│   ├── Dockerfile
+│   └── src/
+├── k8s/
+│   ├── ticket-api-deployment.yaml
+│   ├── ...
+│   └── ...
+├── scripts/
+│   ├── setup.sh
+│   └── teardown.sh
+└── README.md
+Cada servicio debe tener su propio Dockerfile. Los manifiestos de Kubernetes van en k8s/.
+2 Requerimientos técnicos
+• Cluster de kubernetes en EKS
+• DynamoDB con tabla de eventos. Al menos 2 conciertos precargados.
+• RDS PostgreSQL con tabla reservations accesible desde los pods.
+• SQS FIFO con concert_id como MessageGroupId.
+• Credenciales de RDS almacenadas en Secrets Manager e inyectadas como variables de entorno.
+• ticket-api desplegado en k8s, expuesto vía NodePort.
+• ticket-worker desplegado en k8s como Deployment con 1 réplica.
+• ticket-checkout desplegado en k8s como Deployment.
+• Manifiestos de Kubernetes de los 3 Deployments.
+• Imágenes de los 3 servicios publicadas en Amazon ECR.
+• teardown.sh que destruya todos los recursos.
+3 Entregables
+1. Reporte en PDF:
+◦ Máximo 2 hojas. Sin portada.
+◦ Nombre, materia y fecha.
+◦ Descripción del proyecto y diagrama de arquitectura (200-300 palabras).
+◦ Responde las siguientes tres preguntas:
+1. ¿Para qué sirve SQS FIFO con MessageGroupId y cómo se usa en esta actividad?
+2. ¿Qué problema resuelve FOR UPDATE y cómo garantiza consistencia? ¿Cuál es el trade-off entre concurrencia y consistencia en este sistema?
+3. ¿Qué beneficios te da usar EKS en este caso?
+2. Código en repositorio de GitHub con README y teardown.sh.
+3. Video demostrativo (5-10 min):
+◦ Es requisito que todo corra en la nube.
+◦ Muestra el cluster con kubectl get pods y kubectl get services.
+◦ Escenario de nicho: 3-5 reservaciones exitosas. Muestra el estado en RDS y en DynamoDB.
+◦ Escenario de alta demanda: envía más reservaciones de las que hay boletos disponibles. Muestra las reservaciones con estado rejected en RDS.
+◦ Al terminar, ejecuta teardown.sh y muestra en consola que los recursos fueron eliminados.
+4 Checklist de revisión
+Cada uno de estos aspectos tiene un valor de 10 puntos y se asignan los puntos de acuerdo a qué tan completo esté.
+1. Entregables completos y explicados: reporte, repositorio y video.
+2. Cluster de EKS. kubectl get nodes muestra los dos nodos en estado Ready.
+3. Bases de datos.
+◦ DynamoDB con tabla de eventos: concert_id como llave, campos de evento (nombre, fecha, recinto) y capacity con la capacidad máxima por sección. Al menos 2 conciertos precargados.
+◦ RDS PostgreSQL accesible desde los pods con tabla reservations creada y con el schema correcto.
+4. SQS FIFO configurada con concert_id como MessageGroupId.
+5. ticket-api POST /reserve inserta la reservación en RDS con estado pending, encola el mensaje y regresa reservation_id. Debes mostrar que el mensaje llega a SQS.
+6. ticket-api GET /reservation/{id} regresa el estado actualizado de la reservación.
+7. ticket-worker calcula la disponibilidad consultando DynamoDB y RDS.
+◦ Usa FOR UPDATE en la transacción de PostgreSQL para evitar race conditions.
+◦ Se prueba escalando a 3 réplicas simultáneamente: no hay sobreventa, todos los boletos se cuentan correctamente.
+◦ Si no hay espacio, actualiza a rejected sin modificar otras filas.
+8. ticket-checkout responde 200 OK y ticket-worker actualiza el estado a confirmed en RDS.
+9. Manifiestos de kubernetes de los 3 Deployments. Imágenes publicadas en Amazon ECR.
+10. Video con los dos escenarios, evidencia en DynamoDB y RDS. Incluye la ejecución de teardown.sh y confirmación de que los recursos fueron eliminados.
+5 Referencias
+• Ticketmaster System Design: Building a platform that survives million-user stampedesLinks to an external site.
+• Stripe: Accept a paymentLinks to an external site.
+• PayPal Technology BlogLinks to an external site.
+ 
+Ítem del módulo anterior
+Ítem del módulo siguiente
+ 
+       

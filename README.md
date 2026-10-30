@@ -1,142 +1,89 @@
-# Concertpass: sistema de reservación de boletos
+# Concertpass
 
-Concertpass es un sistema de reservación de boletos para conciertos compuesto por tres microservicios desplegados en un cluster EKS de AWS. El sistema recibe solicitudes de compra, las procesa en orden por concierto mediante SQS FIFO, y garantiza que no se venda más del aforo disponible usando una transacción con `FOR UPDATE` en PostgreSQL.
+Sistema de reservación de boletos desplegado en AWS EKS. El API guarda reservas pending en RDS PostgreSQL y publica mensajes SQS FIFO con MessageGroupId=concert_id. El worker consulta la capacidad en DynamoDB y aparta o rechaza boletos en una transacción. Checkout simula autorizar el pago; el worker actualiza a confirmed.
 
-- `ticket-api`: recibe `POST /reserve`, inserta la reservación en RDS con estado `pending`, encola el mensaje en SQS FIFO con `MessageGroupId=concert_id` y expone `GET /reservation/{id}`.
-- `ticket-worker`: consume SQS FIFO, consulta la capacidad del concierto en DynamoDB, calcula la disponibilidad en RDS con `FOR UPDATE`, actualiza a `booked` o `rejected`, y confirma con `ticket-checkout` para pasar a `confirmed`.
-- `ticket-checkout`: simula el procesador de pagos; `POST /checkout` responde 200 OK y el worker actualiza a `confirmed`.
-Los tres servicios tienen Dockerfile, imagen publicada en Amazon ECR y manifiesto de Kubernetes en `k8s/`.
+Estados: pending → booked → confirmed, o pending → rejected.
 
-## Nota sobre la estructura del repositorio
+## Infraestructura
 
-La estructura difiere ligeramente del layout sugerido en el enunciado:
+Terraform es el punto de entrada de todo el despliegue. Crea RDS, Secrets Manager, DynamoDB con dos conciertos, SQS FIFO con DLQ y tres repositorios ECR. Para cumplir el uso de eksctl requerido por la práctica, Terraform ejecuta eksctl para crear EKS y un grupo administrado de exactamente dos nodos. **eksctl usa CloudFormation internamente**; sus stacks se crean y eliminan dentro del ciclo de Terraform.
 
-- Los scripts viven en `apps/scripts/` (no en `scripts/` en la raíz).
-- Los servicios están bajo `apps/` (`apps/ticket-api/`, etc.).
+Se reutilizan LabRole y la VPC predeterminada de AWS Academy. No se crean roles IAM. Las aplicaciones reciben configuración mediante ConfigMap y Secret; las credenciales de RDS proceden de Secrets Manager. DynamoDB es de solo lectura para el código de los servicios.
 
-Esta organización se adoptó desde el inicio del proyecto y se mantiene para no romper rutas ya configuradas por todo el equipo (Dockerfiles, manifiestos, comandos documentados abajo). Todos los comandos de este README usan las rutas reales del repositorio.
+Terraform también construye y publica las imágenes Docker, aplica los manifiestos con kubectl, inicializa la tabla reservations y valida el acceso desde pods a AWS. Los servicios se ejecutan en AWS; Python, Terraform, Docker y kubectl son herramientas de despliegue en el equipo del operador.
 
-## Arquitectura
-```mermaid
-flowchart LR
-    U[Cliente] -->|POST /reserve| API[ticket-api<br/>NodePort 30080]
-    API -->|INSERT pending| RDS[(RDS PostgreSQL)]
-    API -->|send_message<br/>MessageGroupId=concert_id| SQS[SQS FIFO + DLQ]
-    SQS -->|polling| W[ticket-worker]
-    W -->|get_item capacity| DDB[(DynamoDB)]
-    W -->|FOR UPDATE<br/>booked/rejected| RDS
-    W -->|POST /checkout| CO[ticket-checkout<br/>ClusterIP]
-    CO -->|200 OK| W
-    W -->|UPDATE confirmed| RDS
-    U -->|GET /reservation/id| API
-    API -->|SELECT status| RDS
+## Requisitos
 
-    TF[Terraform] -.-> API
-    TF -.-> RDS
-    TF -.-> SQS
-    TF -.-> DDB
-    TF -.-> CO
-```
+AWS CLI con credenciales vigentes del laboratorio, Terraform >=1.5, Python >=3.9, kubectl y Docker con motor Linux activo. Para la demostración se necesita Bash (Git Bash en Windows). Si eksctl no está instalado, el adaptador descarga la versión fijada y verifica su SHA256 oficial.
 
-## Recursos
+## Desplegar
 
-Terraform crea EKS con dos nodos administrados, sus addons CNI/CoreDNS/kube-proxy, PostgreSQL RDS privado, Secrets Manager, SQS FIFO con DLQ, DynamoDB con dos conciertos precargados y tres repositorios ECR. Utiliza dos subredes de la VPC predeterminada y reutiliza `LabRole` para EKS y EC2, tal como esta configurado en AWS Academy. No modifica ni elimina la VPC ni los roles existentes.
-
-El cluster se administra con Terraform, incluido su teardown. La identidad que crea el cluster recibe acceso administrador a Kubernetes. Los pods usan las credenciales temporales del rol del nodo mediante IMDSv2; este esquema del laboratorio comparte los permisos de `LabRole` entre pods. No se generan llaves AWS para los servicios.
-
-RDS acepta el puerto 5432 solamente desde el security group del cluster. El API usa NodePort 30080; `api_allowed_cidr` permite restringir su entrada. Checkout usa ClusterIP y el worker no publica puertos. Los probes TCP funcionan con los servicios actuales sin exigir nuevos endpoints.
-
-## Herramientas y credenciales
-
-Se requieren Terraform >= 1.5, AWS CLI, kubectl y Python >= 3.9. Docker Desktop con contenedores Linux se necesita solamente para construir y publicar imagenes. Los scripts no requieren paquetes Python adicionales ni jq.
+Desde la raíz:
 
 ```powershell
 aws sts get-caller-identity
-python apps/scripts/infrastructure.py setup
+python apps/scripts/infrastructure.py setup --auto-approve
 ```
 
-El setup muestra el plan y solicita la confirmacion de Terraform. Crea los recursos, guarda un kubeconfig en `infra/.generated/`, inyecta la configuracion y el Secret de RDS, espera los dos nodos Ready y ejecuta un Job que crea la tabla `reservations` e indice. No despliega aplicaciones automaticamente. Para configurar Kubernetes sobre recursos ya creados: `python apps/scripts/infrastructure.py setup --configure-only`.
-
-Tambien se puede usar Bash:
-
-```bash
-bash apps/scripts/setup.sh
-```
-
-La region, version de Kubernetes, tipos de instancia, roles y CIDR de acceso se configuran en `infra/variables.tf`; pueden sobreescribirse mediante un archivo local `infra/terraform.tfvars`, que esta ignorado por Git. El estado Terraform y sus planes contienen datos sensibles y tambien se excluyen de Git. No se deben compartir credenciales por el repositorio.
-
-## Variables para los servicios
-
-El ConfigMap `runtime-config` entrega `AWS_REGION`, `AWS_DEFAULT_REGION`, `SQS_QUEUE_URL`, `EVENTS_TABLE`, `CHECKOUT_URL` y `PGSSLMODE=require`. `CHECKOUT_URL` es la URL base interna de checkout; el servicio que lo consume agrega su ruta `/checkout`. El Secret `database` entrega `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER` y `DB_PASSWORD` al API y al worker. El setup obtiene estos valores de Secrets Manager y los envia a Kubernetes por stdin, sin escribirlos en archivos ni argumentos de procesos.
-
-Los valores de capacidad se precargan mediante Terraform en DynamoDB. Publicar mensajes FIFO con `MessageGroupId=concert_id`, decidir inventario y actualizar estados son responsabilidades del codigo de los servicios.
-
-## Imagenes y manifiestos
-
-Publica las imagenes de los servicios con un tag nuevo:
+También se puede ejecutar `bash apps/scripts/setup.sh --auto-approve`, o directamente:
 
 ```powershell
-python apps/scripts/infrastructure.py images --tag entrega-01
-python apps/scripts/infrastructure.py deploy --tag entrega-01
+terraform -chdir=infra init
+terraform -chdir=infra apply
 ```
 
-## Scripts de escenarios y evidencia
+El primer despliegue puede tardar varios minutos. No ejecutes dos apply simultáneamente. El kubeconfig aislado se guarda en infra/.generated/kubeconfig. Estado, planes, kubeconfig y archivos generados están ignorados por Git porque pueden contener información sensible.
 
-Todos en `apps/scripts/`. Requieren la infraestructura creada (`setup`) y los pods desplegados (`deploy`).
-
-| Script | Uso |
-|---|---|
-| `lib.sh` | Funciones compartidas (no se ejecuta directamente). |
-| `evidence.sh` | Evidencia para el video: `rds`, `dynamodb`, `sqs`, `sqs-demo`, `reset`, `all`. |
-| `scenario-niche.sh` | Escenario de poca demanda: las 4 reservas terminan `confirmed`. |
-| `scenario-high-demand.sh` | Escenario de alta demanda con `--workers 3` por defecto: envia 60 reservas de `vip` (capacidad 50) y verifica que no hay sobreventa. |
-| `verify-teardown.sh` | Confirma con AWS CLI que `teardown.sh` elimino todos los recursos. |
-
-Ciclo completo para la demostracion:
-
-```bash
-bash apps/scripts/evidence.sh reset --yes
-bash apps/scripts/evidence.sh sqs-demo
-bash apps/scripts/scenario-niche.sh
-bash apps/scripts/scenario-high-demand.sh
-bash apps/scripts/evidence.sh all
-bash apps/scripts/teardown.sh --auto-approve
-bash apps/scripts/verify-teardown.sh
-```
-
-## Comprobar infraestructura
+## Demostración con un comando
 
 ```powershell
-python apps/scripts/infrastructure.py validate
-python apps/scripts/infrastructure.py status
+python apps/scripts/demo.py --reset --pause 3
+```
+
+**--reset borra todas las reservas y purga las dos colas.** Úsalo para comenzar una demostración desde cero. El script espera 60 segundos tras purgar SQS, muestra las operaciones, hace pausas entre pasos y termina con un resumen PASS/FAIL y código de salida distinto de cero ante un fallo. No elimina la infraestructura al terminar.
+
+Comprueba dos nodos Ready, acceso AWS desde pods, un mensaje real en SQS, pending en RDS y confirmed por GET; después ejecuta cuatro reservas de nicho y 60 solicitudes VIP con tres workers. En una corrida limpia se esperan cuatro confirmed en nicho y 50 confirmed/10 rejected en alta demanda, sin sobreventa. El worker vuelve a una réplica. Se muestran las reservas y capacidades en RDS y DynamoDB y los conteos de SQS/DLQ.
+
+Los conciertos iniciales son artista-nicho-cdmx (general=8, vip=3, floor=4) y bad-bunny-gdl (general=500, vip=50, floor=100). Cada POST crea una reserva nueva y afecta la disponibilidad cuando se confirma.
+
+## Prueba manual
+
+```powershell
 $env:KUBECONFIG = "$PWD/infra/.generated/kubeconfig"
-kubectl get nodes
+kubectl get nodes -o wide
 kubectl -n concertpass get pods,services
 ```
 
-Validate exige exactamente dos nodos Ready, ejecuta un Job que comprueba el acceso del pod a SQS y DynamoDB, y valida contra el API de Kubernetes los tres manifiestos de aplicaciones mediante dry-run. El Job de setup demuestra la conexion de los pods a RDS y la estructura de la tabla. Esta comprobacion no valida la logica de reservaciones; para eso estan los scripts de escenarios descritos arriba.
+Abre http://IP_PUBLICA_DE_UN_NODO:30080/docs para Swagger UI. POST /reserve recibe:
 
-Para consumir el API se usa `http://IP_PUBLICA_DE_UN_NODO:30080` despues de desplegar su imagen. Status muestra las direcciones de los nodos.
+```json
+{"concert_id":"bad-bunny-gdl","user_id":"usr_123","ticket_type":"vip","quantity":2}
+```
 
-## Escenarios de prueba
+Copia reservation_id y consulta GET /reservation/{reservation_id} hasta confirmed o rejected. Cantidades no positivas o identificadores vacíos devuelven 422. La raíz / puede responder 404; la interfaz de pruebas está en /docs. Checkout es interno, recibe reservation_id UUID y quantity positiva y responde 200 autorizando el pago simulado.
 
-El sistema se valida con dos escenarios que cubren los extremos del comportamiento esperado:
+## Consistencia
 
-- **Concierto de nicho** (`artista-nicho-cdmx`, capacidad `general = 8`): 4 reservas de 1 boleto. Todas terminan en `confirmed`. `scenario-niche.sh` lo ejecuta y verifica el resultado.
-- **Concierto de alta demanda** (`bad-bunny-gdl`, capacidad `vip = 50`): 60 reservas de 1 boleto con 3 replicas del worker. Las primeras 50 terminan en `booked`/`confirmed`; las 10 restantes en `rejected`. `scenario-high-demand.sh` lo ejecuta y verifica que no hay sobreventa (vendidos <= capacidad).
+El worker usa un bloqueo transaccional por concierto/sección y SELECT FOR UPDATE sobre filas antes de sumar booked y confirmed. El bloqueo por inventario se toma en una sentencia separada para que la consulta posterior vea un snapshot actualizado. Cuando no hay espacio, hace rollback y actualiza únicamente la reserva rechazada en otra transacción. Los mensajes repetidos revisan el estado para retomar booked o ignorar estados finales.
 
-El video de demostracion sigue este orden: `evidence.sh sqs-demo` (muestra el mensaje en SQS con su `MessageGroupId`), `scenario-niche.sh`, `scenario-high-demand.sh`, `evidence.sh all` (estado en RDS, DynamoDB y SQS), `teardown.sh`, y `verify-teardown.sh` (confirma que no quedan recursos).
+La consulta literal SUM(...) FOR UPDATE del enunciado no es válida en PostgreSQL: el proyecto bloquea filas en una subconsulta y suma fuera de ella. El costo de conservar consistencia es serializar las decisiones sobre un mismo inventario. FIFO mantiene el orden por concierto; diferentes conciertos pueden progresar en paralelo.
 
-## Eliminar recursos
+## Eliminar al terminar
 
 ```powershell
-python apps/scripts/infrastructure.py teardown
+python apps/scripts/infrastructure.py teardown --auto-approve
 ```
+
+Equivalente Bash: `bash apps/scripts/teardown.sh --auto-approve`. El teardown elimina el namespace y Terraform destruye los recursos, invocando eksctl delete cluster --wait para el clúster y sus stacks. Conserva la VPC y los roles preexistentes. Después ejecuta:
 
 ```bash
-bash apps/scripts/teardown.sh
+bash apps/scripts/verify-teardown.sh
 ```
 
-Se elimina el namespace y Terraform solicita confirmacion antes de destruir sus recursos. Esto borra los datos de RDS/DynamoDB, los mensajes y las imagenes ECR del stack. Los scripts setup y teardown aceptan `--auto-approve` para un ciclo automatizado autorizado. EKS, nodos y RDS generan cargos mientras permanezcan creados; la validacion acordada para este trabajo termina con teardown.
+Debe terminar PASS sin resultados desconocidos. La eliminación borra los datos, mensajes e imágenes del proyecto. EKS, nodos y RDS generan cargos mientras existan.
 
-Los resultados del ciclo real de creacion, despliegue, validacion y eliminacion estan en [infra/VALIDATION.md](infra/VALIDATION.md).
+## Estructura
+
+Servicios y Dockerfiles: apps/ticket-api, apps/ticket-worker y apps/ticket-checkout. Scripts: apps/scripts, como exige la sección 1.10. Manifiestos: k8s. Terraform: infra. Este layout mantiene las rutas existentes del equipo; difiere del árbol ilustrativo del enunciado que sitúa servicios y scripts en la raíz.
+
+Resultados históricos: [infra/VALIDATION.md](infra/VALIDATION.md). No sustituyen la salida de una demostración sobre el despliegue actual. Reporte y video son entregables preparados por el equipo.

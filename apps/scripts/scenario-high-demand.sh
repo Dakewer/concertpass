@@ -134,7 +134,7 @@ log "Vendidos (booked + confirmed) = $final_sold   Capacidad = $capacity"
 
 verdict=0
 if [ "$settled" -ne 1 ]; then
-  log "FAIL: quedaron reservaciones sin procesar despues de ${TIMEOUT}s (¿el worker esta corriendo?)."
+  log "FAIL: quedaron reservaciones sin procesar despues de ${TIMEOUT}s (Â¿el worker esta corriendo?)."
   verdict=1
 fi
 if [ "$final_sold" -gt "$capacity" ]; then
@@ -154,7 +154,8 @@ if [ "$QUANTITY" -eq 1 ]; then
   fi
 fi
 if [ "$failed" -gt 0 ]; then
-  log "AVISO: $failed peticiones no devolvieron HTTP 200 (revisa los logs de ticket-api)."
+  log "FAIL: $failed peticiones no devolvieron HTTP 200 (revisa los logs de ticket-api)."
+  verdict=1
 fi
 
 step "Resultado"
